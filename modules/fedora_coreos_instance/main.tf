@@ -1,18 +1,11 @@
-terraform {
-  required_providers {
-    proxmox = {
-      source  = "bpg/proxmox"
-      version = "0.61.1"
-    }
-  }
-}
 
-resource "proxmox_virtual_environment_vm" "node" {
+
+resource "proxmox_virtual_environment_vm" "fedora_coreos_instance" {
   name          = var.name
   on_boot       = var.autostart
   node_name     = var.target_node
   scsi_hardware = "virtio-scsi-pci"
-  kvm_arguments = "-fw_cfg name=opt/com.coreos/config,file=/root/ignition/ignition_${var.name}.ign"
+  kvm_arguments = "-fw_cfg name=opt/com.coreos/config,file=${var.snippet_storage_path}ignition_${var.name}.ign"
 
   memory {
     dedicated = var.memory
@@ -31,14 +24,21 @@ resource "proxmox_virtual_environment_vm" "node" {
   }
 
   clone {
+    node_name = var.template_node
     retries = 3
-    vm_id   = 7000
+    vm_id   = var.template_vm_id
     full    = true
   }
 
   network_device {
     model  = "virtio"
-    bridge = var.default_bridge
+    bridge = var.default_network_bridge
+  }
+
+  lifecycle {
+    ignore_changes = [ 
+      vga,
+    ]
   }
 
   provisioner "local-exec" {
@@ -53,7 +53,7 @@ resource "proxmox_virtual_environment_vm" "node" {
           break
         fi
         n=$((n+1)) 
-        sleep $[ ( $RANDOM % 10 )  + 1 ]s
+        sleep $(( ( RANDOM % 10 ) + 1 ))s      
       done
     EOT
     environment = {
@@ -75,7 +75,7 @@ resource "proxmox_virtual_environment_vm" "node" {
           break
         fi
         n=$((n+1)) 
-        sleep $[ ( $RANDOM % 10 )  + 1 ]s
+        sleep $(( ( RANDOM % 10 ) + 1 ))s
       done
     EOT
     environment = {

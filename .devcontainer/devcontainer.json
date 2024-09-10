@@ -1,0 +1,42 @@
+{
+    "name": "ProxMox-CoreOS-k0s-Cluster",
+    "image" : "mcr.microsoft.com/vscode/devcontainers/python",
+
+    "customizations" : {
+        "vscode": {
+            "extensions": [
+                "redhat.ansible",
+                "hashicorp.terraform",
+                "ms-kubernetes-tools.vscode-kubernetes-tools",
+                "eamodio.gitlens"
+              ]
+        }
+    },
+
+    "features": {
+		"ghcr.io/prulloac/devcontainer-features/chezmoi:1": {},
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true,
+            "installOhMyZsh": true,
+            "installOhMyZshConfig": true,
+            "upgradePackages": true,
+            "username": "automatic",
+            "userUid": "automatic",
+            "userGid": "automatic"
+        },		
+        "ghcr.io/devcontainers/features/terraform:1": {},
+        "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {},        
+        "golang": "latest"
+    },
+
+    "mounts": [
+        "source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,type=bind"
+    ],
+
+    "postCreateCommand": "/bin/bash ./.devcontainer/post-install.sh"
+ }
+
+
+
+ 

@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# This script creates a CoreOS ProxMox template
+# It uses parameters passed from Terraform's templatefile function
+
+# Parameters:
+# ${vm_id}                  - The ID for the VM (e.g., 9500)
+# ${memory}                 - Memory allocation in MB (e.g., 2048)
+# ${network_bridge}         - Network bridge to use (e.g., vmbr0)
+# ${iso_storage_path}       - Path to the ISO storage
+# ${coreos_image_filename}  - Name of the CoreOS image file
+# ${vm_disk_datastore_id}   - Storage location for the VM disk
+# ${additional_disk_size}   - Additional disk capacity to add (e.g., +10G)
+# ${cloud_init_user}        - Cloud-init user
+# ${ssh_public_keys}        - SSH public key(s)
+
+# Destroy existing VM with the same ID (if it exists)
+qm destroy ${vm_id} --destroy-unreferenced-disks=1 --purge
+sleep 5
+
+# Create a new VM
+qm create ${vm_id} --memory ${memory} --net0 virtio,bridge=${network_bridge} --agent 1
+
+# Import the CoreOS disk
+qm importdisk ${vm_id} ${iso_storage_path}${coreos_image_filename} ${vm_disk_datastore_id}
+
+# Configure the VM's hardware and storage
+qm set ${vm_id} --scsihw virtio-scsi-pci --virtio0 ${vm_disk_datastore_id}:vm-${vm_id}-disk-0,cache=writeback,discard=on
+
+# Resize the disk
+qm resize ${vm_id} virtio0 ${additional_disk_size}
+
+# Set boot options
+qm set ${vm_id} --boot c --bootdisk virtio0
+
+# Configure cloud-init
+qm set ${vm_id} --ide2 ${vm_disk_datastore_id}:cloudinit
+qm set ${vm_id} --ciuser ${cloud_init_user} --citype nocloud --ipconfig0 ip=dhcp
+
+# Write supplied ssh public key to /tmp
+echo "${ssh_public_keys}" >/tmp/sshkeys
+# Add SSH key
+qm set ${vm_id} --sshkeys "/tmp/sshkeys"
+
+# Set the template name and convert to template
+qm set ${vm_id} --name coreos-golden --template 1
+
+# Add ProxMox tags: cloud-image and CoreOS
+qm set ${vm_id} --tags cloud-image,CoreOS

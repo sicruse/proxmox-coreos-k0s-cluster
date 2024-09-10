@@ -1,23 +1,22 @@
-terraform {
-  required_providers {
-    proxmox = {
-      source  = "bpg/proxmox"
-      version = "0.61.1"
-    }
-  }
-}
-
 data "local_file" "ssh_public_key" {
-  filename = pathexpand("~/.ssh/id_rsa.pub")
+  filename = pathexpand(var.public_key)
 }
 
-resource "proxmox_virtual_environment_file" "cloud_config" {
-  content_type = "snippets"
-  datastore_id = "local"
-  node_name    = var.TARGET_NODE
+resource "null_resource" "cloud_config" {
 
-  source_raw {
-    data = <<-EOF
+  depends_on = [
+    data.local_file.ssh_public_key
+  ]
+
+  connection {
+    type     = "ssh"
+    user     = var.proxmox_user
+    password = var.proxmox_password
+    host     = var.proxmox_host
+  }
+
+  provisioner "file" {
+    content = <<-EOF
     #cloud-config
     users:
       - default
@@ -31,7 +30,7 @@ resource "proxmox_virtual_environment_file" "cloud_config" {
     runcmd:
         - apt update -y && apt dist-upgrade -y
         - apt install -y qemu-guest-agent haproxy net-tools unattended-upgrades
-        - timedatectl set-timezone America/Toronto
+        - timedatectl set-timezone America/New_York
         - systemctl enable qemu-guest-agent
         - systemctl enable --now haproxy
         - systemctl start qemu-guest-agent
@@ -39,55 +38,68 @@ resource "proxmox_virtual_environment_file" "cloud_config" {
         - echo "done" > /tmp/cloud-config.done
     EOF
 
-    file_name = "cloud-config.yaml"
+    destination = "${var.proxmox_snippet_storage_path}cloud-config.yaml"
   }
 }
 
-resource "proxmox_virtual_environment_download_file" "ubuntu_cloud_image" {
-  content_type = "iso"
-  datastore_id = "local"
-  node_name    = var.TARGET_NODE
+resource "proxmox_virtual_environment_vm" "haproxy" {
 
-  url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-}
+  depends_on = [
+    null_resource.cloud_config
+  ]
 
-resource "proxmox_virtual_environment_vm" "node" {
   name      = "haproxy"
-  node_name = var.TARGET_NODE
+  node_name = var.target_node
 
   agent {
     enabled = true
   }
 
   cpu {
-    cores = 2
+    cores   = 2
+    sockets = 2
+    type    = "host"
+    numa    = true
   }
 
   memory {
     dedicated = 2048
   }
 
-  disk {
-    datastore_id = "local-lvm"
-    file_id      = proxmox_virtual_environment_download_file.ubuntu_cloud_image.id
-    interface    = "virtio0"
-    iothread     = true
-    discard      = "on"
-    size         = 20
+  clone {
+    node_name = var.template_node
+    retries   = 3
+    vm_id     = var.template_vm_id
+    full      = true
   }
 
   initialization {
+    datastore_id = var.proxmox_vm_disk_datastore_id
+
     ip_config {
       ipv4 {
-        address = "dhcp"
+        address = var.ip_address
+        gateway = var.gateway
       }
     }
 
-    user_data_file_id = proxmox_virtual_environment_file.cloud_config.id
+    user_data_file_id = "${var.proxmox_snippet_datastore_id}:snippets/cloud-config.yaml"
   }
 
   network_device {
-    bridge = var.DEFAULT_BRIDGE
+    model  = "virtio"
+    bridge = "vmbr0"
+  }
+
+  serial_device {
+    device = "socket"
+  }
+
+  lifecycle {
+    ignore_changes = [
+      initialization[0].user_account, # inherited from the cloned image
+      vga,
+    ]
   }
 
   provisioner "local-exec" {
@@ -102,7 +114,7 @@ resource "proxmox_virtual_environment_vm" "node" {
           break
         fi
         n=$((n+1)) 
-        sleep $[ ( $RANDOM % 10 )  + 1 ]s
+        sleep $(( ( RANDOM % 10 ) + 1 ))s      
       done
     EOT
     environment = {
@@ -124,7 +136,7 @@ resource "proxmox_virtual_environment_vm" "node" {
           break
         fi
         n=$((n+1)) 
-        sleep $[ ( $RANDOM % 10 )  + 1 ]s
+        sleep $(( ( RANDOM % 10 ) + 1 ))s      
       done
     EOT
     environment = {

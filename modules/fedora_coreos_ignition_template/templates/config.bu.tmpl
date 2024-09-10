@@ -1,6 +1,7 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Relativ-IT/Butane-Schemas/Release/Butane-Schema.json
 ---
 variant: fcos
-version: 1.4.0
+version: 1.5.0
 systemd:
   units:
     - name: setup-qemu-ga.service
@@ -46,7 +47,7 @@ storage:
       mode: 0644
       contents:
         inline:
-          ${domain_name}
+          ${host_name}
 passwd:
   users:
     - name: core

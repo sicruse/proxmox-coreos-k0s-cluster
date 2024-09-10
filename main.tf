@@ -1,19 +1,4 @@
-terraform {
-  required_providers {
-    proxmox = {
-      source  = "bpg/proxmox"
-      version = "0.61.1"
-    }
-  }
-}
-
-provider "proxmox" {
-  endpoint = var.PROXMOX_API_ENDPOINT
-  username = "${var.PROXMOX_USERNAME}@pam"
-  password = var.PROXMOX_PASSWORD
-  insecure = true
-}
-
+## Establish the latest version IDs for Fedora Core OS & k0s
 data "external" "versions" {
   program = [
     "${path.module}/scripts/versions.sh",
@@ -21,195 +6,217 @@ data "external" "versions" {
 }
 
 locals {
-  ha_proxy_user = "ubuntu"
-  fcos_version  = data.external.versions.result["fcos_version"]
-  k0s_version   = data.external.versions.result["k0s_version"]
-  iso_url       = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/${local.fcos_version}/x86_64/fedora-coreos-${local.fcos_version}-qemu.x86_64.qcow2.xz"
+  k0s_version                = data.external.versions.result["k0s_version"]
+  coreos_version             = data.external.versions.result["fcos_version"]
+  coreos_image_url           = "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/${local.coreos_version}/x86_64/fedora-coreos-${local.coreos_version}-qemu.x86_64.qcow2.xz"
+  coreos_compressed_filename = basename(local.coreos_image_url)
+  coreos_filename            = trimsuffix(local.coreos_compressed_filename, ".xz")
+  coreos_local_path          = "/tmp/"
+  coreos_compressed_file_uri = "${local.coreos_local_path}${local.coreos_compressed_filename}"
+  coreos_file_uri            = "${local.coreos_local_path}${local.coreos_filename}"
+  coreos_file_image_uri      = "${local.coreos_file_uri}.img"
 }
 
-resource "null_resource" "download_fcos_image" {
+# Download & decompress the latest Fedora Core OS image
+resource "null_resource" "coreos_qcow2" {
   provisioner "local-exec" {
     when    = create
-    command = <<EOF
-      if [[ ! -f ${path.root}/coreos.qcow2 ]]; then
-        wget ${local.iso_url} -O coreos.qcow2.xz && rm -f coreos.qcow2 && xz -v -d coreos.qcow2.xz
+    command = <<-EOT
+      if [ ! -f ${local.coreos_file_image_uri} ]; then \
+        rm -f ${local.coreos_file_image_uri} && \
+        wget ${local.coreos_image_url} -O ${local.coreos_compressed_file_uri} && \
+        xz -v -d ${local.coreos_compressed_file_uri} && \
+        mv ${local.coreos_file_uri} ${local.coreos_file_image_uri}; \
       fi
-    EOF
+    EOT
   }
 }
 
-resource "null_resource" "copy_qcow2_image" {
-  depends_on = [
-    null_resource.download_fcos_image
-  ]
-  provisioner "remote-exec" {
-    connection {
-      host        = var.PROXMOX_IP
-      user        = var.PROXMOX_USERNAME
-      private_key = file("~/.ssh/id_rsa")
-    }
+## Upload the latest Fedora CoreOS image to ProxMox ISO data storage
+resource "proxmox_virtual_environment_file" "coreos_qcow2" {
+  depends_on = [null_resource.coreos_qcow2]
 
-    inline = [
-      "rm -rf /root/fcos-cluster",
-      "mkdir /root/fcos-cluster",
-      "rm -rf /root/ignition",
-      "mkdir /root/ignition"
-    ]
+  content_type = "iso"
+  datastore_id = var.proxmox.iso_datastore_id
+  node_name    = var.proxmox.host
+
+  source_file {
+    path = local.coreos_file_image_uri
   }
+}
+
+## Build Ignition files for each Fedora Core OS host and store them in the ProxMox snippits data store
+module "master-ignition" {
+  depends_on                   = [proxmox_virtual_environment_file.coreos_qcow2]
+  source                       = "./modules/fedora_coreos_ignition_template"
+  host_name                    = format("master%s", count.index)
+  proxmox_snippet_datastore_id = var.proxmox.snippet_datastore_id
+  proxmox_host                 = var.proxmox.host
+  count                        = var.kubernetes.master.count
+  ssh_public_key_path          = var.kubernetes.ssh_public_key_path
+}
+
+module "worker-ignition" {
+  depends_on                   = [proxmox_virtual_environment_file.coreos_qcow2]
+  source                       = "./modules/fedora_coreos_ignition_template"
+  host_name                    = format("worker%s", count.index)
+  proxmox_snippet_datastore_id = var.proxmox.snippet_datastore_id
+  proxmox_host                 = var.proxmox.host
+  count                        = var.kubernetes.worker.count
+  ssh_public_key_path          = var.kubernetes.ssh_public_key_path
+}
+
+resource "null_resource" "coreos_proxmox_template" {
+  depends_on = [module.master-ignition, module.worker-ignition]
 
   provisioner "file" {
-    source      = "${path.root}/coreos.qcow2"
-    destination = "/root/fcos-cluster/coreos.qcow2"
     connection {
       type        = "ssh"
-      host        = var.PROXMOX_IP
-      user        = var.PROXMOX_USERNAME
-      private_key = file("~/.ssh/id_rsa")
+      host        = var.proxmox.host
+      user        = var.proxmox.user
+      private_key = file(var.proxmox.ssh_private_key_path)
     }
-  }
-}
 
-resource "null_resource" "copy_ssh_keys" {
-  depends_on = [
-    null_resource.copy_qcow2_image
-  ]
-  provisioner "file" {
-    source      = "~/.ssh/id_rsa.pub"
-    destination = "/root/fcos-cluster/id_rsa.pub"
-    connection {
-      type        = "ssh"
-      host        = var.PROXMOX_IP
-      user        = var.PROXMOX_USERNAME
-      private_key = file("~/.ssh/id_rsa")
-    }
+    content = templatefile("${path.module}/templates/coreos_proxmox_template.tmpl", {
+      vm_id                 = var.coreos_template.vm_id
+      memory                = var.coreos_template.memory
+      network_bridge        = var.coreos_template.network_bridge
+      iso_storage_path      = var.proxmox.iso_storage_path
+      coreos_image_filename = basename(local.coreos_file_image_uri)
+      vm_disk_datastore_id  = var.proxmox.vm_disk_datastore_id
+      additional_disk_size  = var.coreos_template.additional_disk_size
+      cloud_init_user       = var.coreos_template.cloud_init_user
+      ssh_public_keys       = var.coreos_template.ssh_public_keys
+      template_name         = var.coreos_template.template_name
+    })
+    destination = "/tmp/coreos_proxmox_template.sh"
   }
-}
 
-resource "null_resource" "create_template" {
-  depends_on = [
-    null_resource.copy_ssh_keys
-  ]
   provisioner "remote-exec" {
     when = create
     connection {
-      host        = var.PROXMOX_IP
-      user        = var.PROXMOX_USERNAME
-      private_key = file("~/.ssh/id_rsa")
+      type        = "ssh"
+      host        = var.proxmox.host
+      user        = var.proxmox.user
+      private_key = file(var.proxmox.ssh_private_key_path)
     }
 
-    script = "${path.root}/scripts/template.sh"
+    # Use the templatefile function to render the template creation bash script
+    inline = [
+      "chmod +x /tmp/coreos_proxmox_template.sh",
+      "/tmp/coreos_proxmox_template.sh",
+    ]
   }
 }
 
 resource "time_sleep" "sleep" {
   depends_on = [
-    null_resource.create_template
+    null_resource.coreos_proxmox_template
   ]
   create_duration = "30s"
 }
 
-module "master-ignition" {
-  depends_on = [
-    null_resource.copy_qcow2_image
-  ]
-  source           = "./modules/ignition"
-  name             = format("master%s", count.index)
-  proxmox_user     = var.PROXMOX_USERNAME
-  proxmox_password = var.PROXMOX_PASSWORD
-  proxmox_host     = var.PROXMOX_IP
-  count            = var.MASTER_COUNT
-}
-
-module "worker-ignition" {
-  depends_on = [
-    null_resource.copy_qcow2_image
-  ]
-  source           = "./modules/ignition"
-  name             = format("worker%s", count.index)
-  proxmox_user     = var.PROXMOX_USERNAME
-  proxmox_password = var.PROXMOX_PASSWORD
-  proxmox_host     = var.PROXMOX_IP
-  count            = var.WORKER_COUNT
-}
-
-module "master_domain" {
+module "master_fedora_coreos_instance" {
 
   depends_on = [
     time_sleep.sleep
   ]
 
-  source         = "./modules/domain"
-  count          = var.MASTER_COUNT
-  name           = format("master%s", count.index)
-  memory         = var.master_config.memory
-  vcpus          = var.master_config.vcpus
-  sockets        = var.master_config.sockets
-  autostart      = var.autostart
-  default_bridge = var.DEFAULT_BRIDGE
-  target_node    = var.TARGET_NODE
+  source                 = "./modules/fedora_coreos_instance"
+  count                  = var.kubernetes.master.count
+  name                   = format("master%s", count.index)
+  memory                 = var.kubernetes.master.memory
+  vcpus                  = var.kubernetes.master.vcpus
+  sockets                = var.kubernetes.master.sockets
+  autostart              = var.kubernetes.autostart
+  default_network_bridge = var.proxmox.network_bridge
+  template_node          = var.proxmox.template_node
+  template_vm_id         = var.coreos_template.template_vm_id
+  target_node            = var.kubernetes.master.target_node
+  snippet_storage_path   = var.proxmox.snippet_storage_path
 }
 
-module "worker_domain" {
+module "worker_fedora_coreos_instance" {
 
   depends_on = [
     time_sleep.sleep
   ]
 
-  source         = "./modules/domain"
-  count          = var.WORKER_COUNT
-  name           = format("worker%s", count.index)
-  memory         = var.worker_config.memory
-  vcpus          = var.worker_config.vcpus
-  sockets        = var.worker_config.sockets
-  autostart      = var.autostart
-  default_bridge = var.DEFAULT_BRIDGE
-  target_node    = var.TARGET_NODE
+  source                 = "./modules/fedora_coreos_instance"
+  count                  = var.kubernetes.worker.count
+  name                   = format("worker%s", count.index)
+  memory                 = var.kubernetes.worker.memory
+  vcpus                  = var.kubernetes.worker.vcpus
+  sockets                = var.kubernetes.worker.sockets
+  autostart              = var.kubernetes.autostart
+  default_network_bridge = var.proxmox.network_bridge
+  template_node          = var.proxmox.template_node
+  template_vm_id         = var.coreos_template.template_vm_id
+  target_node            = var.kubernetes.worker.target_node
+  snippet_storage_path   = var.proxmox.snippet_storage_path
 }
 
-module "proxy" {
-  source         = "./modules/proxy"
-  ha_proxy_user  = local.ha_proxy_user
-  DEFAULT_BRIDGE = var.DEFAULT_BRIDGE
-  TARGET_NODE    = var.TARGET_NODE
+module "haproxy" {
+  source                       = "./modules/haproxy"
+  ha_proxy_user                = var.ha_proxy.user
+  default_network_bridge       = var.proxmox.network_bridge
+  template_node                = var.proxmox.template_node
+  target_node                  = var.ha_proxy.target_node
+  template_vm_id               = var.ha_proxy.template_vm_id
+  proxmox_user                 = var.proxmox.user
+  proxmox_password             = var.proxmox.password
+  proxmox_host                 = var.proxmox.host
+  public_key                   = var.proxmox.ssh_public_key_path
+  proxmox_snippet_storage_path = var.proxmox.snippet_storage_path
+  proxmox_snippet_datastore_id = var.proxmox.snippet_datastore_id
+  proxmox_vm_disk_datastore_id = var.proxmox.vm_disk_datastore_id
+  ip_address                   = var.ha_proxy.ip_address
+  gateway                      = var.ha_proxy.gateway
 }
 
+resource "time_sleep" "sleep-haproxy" {
+  depends_on = [
+    module.haproxy.node
+  ]
+  create_duration = "90s"
+}
 
 resource "local_file" "haproxy_config" {
 
   depends_on = [
-    module.master_domain.node,
-    module.worker_domain.node,
-    module.proxy.node
+    module.master_fedora_coreos_instance.node,
+    module.worker_fedora_coreos_instance.node,
+    time_sleep.sleep-haproxy
   ]
 
   content = templatefile("${path.root}/templates/haproxy.tmpl",
     {
       node_map_masters = zipmap(
-        module.master_domain.*.address, module.master_domain.*.name
+        module.master_fedora_coreos_instance.*.address, module.master_fedora_coreos_instance.*.name
       ),
       node_map_workers = zipmap(
-        module.worker_domain.*.address, module.worker_domain.*.name
+        module.worker_fedora_coreos_instance.*.address, module.worker_fedora_coreos_instance.*.name
       )
     }
   )
-  filename = "haproxy.cfg"
+  filename = "/tmp/haproxy.cfg"
 
   provisioner "file" {
-    source      = "${path.root}/haproxy.cfg"
+    source      = "/tmp/haproxy.cfg"
     destination = "/etc/haproxy/haproxy.cfg"
     connection {
       type        = "ssh"
-      host        = module.proxy.proxy_ipv4_address
-      user        = local.ha_proxy_user
-      private_key = file("~/.ssh/id_rsa")
+      host        = module.haproxy.proxy_ipv4_address
+      user        = var.ha_proxy.user
+      private_key = file(var.proxmox.ssh_private_key_path)
     }
   }
 
   provisioner "remote-exec" {
     connection {
-      host        = module.proxy.proxy_ipv4_address
-      user        = local.ha_proxy_user
-      private_key = file("~/.ssh/id_rsa")
+      host        = module.haproxy.proxy_ipv4_address
+      user        = var.ha_proxy.user
+      private_key = file(var.proxmox.ssh_private_key_path)
     }
 
     inline = [
@@ -227,27 +234,29 @@ resource "local_file" "k0sctl_config" {
   content = templatefile("${path.root}/templates/k0s.tmpl",
     {
       node_map_masters = zipmap(
-        tolist(module.master_domain.*.address), tolist(module.master_domain.*.name)
+        tolist(module.master_fedora_coreos_instance.*.address), tolist(module.master_fedora_coreos_instance.*.name)
       ),
       node_map_workers = zipmap(
-        tolist(module.worker_domain.*.address), tolist(module.worker_domain.*.name)
+        tolist(module.worker_fedora_coreos_instance.*.address), tolist(module.worker_fedora_coreos_instance.*.name)
       ),
       "user"        = "core",
       "k0s_version" = local.k0s_version,
-      "ha_proxy_server" : module.proxy.proxy_ipv4_address
+      "ha_proxy_server" : module.haproxy.proxy_ipv4_address,
+      "ssh_private_key_path" = var.proxmox.ssh_private_key_path
     }
   )
   filename = "k0sctl.yaml"
 }
 
-resource "null_resource" "setup_cluster" {
+resource "null_resource" "setup_kubernetes_cluster" {
 
   depends_on = [
     local_file.k0sctl_config
   ]
 
   provisioner "local-exec" {
-    command = <<-EOT
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
       MAX_RETRIES=5
       RETRY_INTERVAL=10
       for ((i = 1; i <= MAX_RETRIES; i++)); do
@@ -268,9 +277,8 @@ resource "null_resource" "setup_cluster" {
       k0sctl kubeconfig > ~/.kube/config --disable-telemetry
       chmod 600 ~/.kube/config
     EOT
-    when    = create
+    when        = create
   }
-
 }
 
 resource "local_file" "ansible_hosts" {
@@ -282,10 +290,10 @@ resource "local_file" "ansible_hosts" {
   content = templatefile("${path.root}/templates/ansible.tmpl",
     {
       node_map_masters = zipmap(
-        tolist(module.master_domain.*.address), tolist(module.master_domain.*.name)
+        tolist(module.master_fedora_coreos_instance.*.address), tolist(module.master_fedora_coreos_instance.*.name)
       ),
       node_map_workers = zipmap(
-        tolist(module.worker_domain.*.address), tolist(module.worker_domain.*.name)
+        tolist(module.worker_fedora_coreos_instance.*.address), tolist(module.worker_fedora_coreos_instance.*.name)
       ),
       "ansible_port" = 22,
       "ansible_user" = "core"
